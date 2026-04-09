@@ -1,0 +1,4 @@
+discord.py>=2.7.0
+numpy
+opencv-python
+reedsolo>=1.7.0
