@@ -68,3 +68,9 @@ python3 Storeii/dec.py ./example.avi ./decoded
 
 - The bot can only send files that fit within Discord's upload limit (10MB) for the current server or DM.
 - Encoding uses a lossless PNG-based AVI stream so the bit pattern survives the round-trip.
+
+
+# Contributions:
+Kartik Tayal - Video processing
+Qazi Ayan - discord bot integeration
+Me - idea, team lead, file handling
