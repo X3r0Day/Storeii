@@ -70,7 +70,9 @@ python3 Storeii/dec.py ./example.avi ./decoded
 - Encoding uses a lossless PNG-based AVI stream so the bit pattern survives the round-trip.
 
 
-# Contributions:
+## Contributions:
 Kartik Tayal - Video processing
+
 Qazi Ayan - discord bot integeration
+
 Me - idea, team lead, file handling
