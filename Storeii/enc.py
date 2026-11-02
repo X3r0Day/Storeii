@@ -12,8 +12,24 @@ from Storeii.codec import (  # noqa: E402
     DEFAULT_HEIGHT,
     DEFAULT_PIXEL_SIZE,
     DEFAULT_WIDTH,
+    StoreiiError,
     encode_file_to_video,
 )
+
+
+def _progress(stream):
+    last = -1
+
+    def show(done, total):
+        nonlocal last
+        pct = done * 100 // total if total else -1
+        if pct == last and done != total:
+            return
+        last = pct
+        stream.write(f"\r  frame {done}/{total} ({pct}%)" if total else f"\r  frame {done}")
+        stream.flush()
+
+    return show
 
 
 def main() -> None:
@@ -36,14 +52,22 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    result = encode_file_to_video(
-        args.input_file,
-        args.output_video,
-        width=args.width,
-        height=args.height,
-        frame_rate=args.frame_rate,
-        pix=args.pix,
-    )
+    print(f"Encoding {args.input_file} ...", file=sys.stderr, flush=True)
+    try:
+        result = encode_file_to_video(
+            args.input_file,
+            args.output_video,
+            width=args.width,
+            height=args.height,
+            frame_rate=args.frame_rate,
+            pix=args.pix,
+            progress=_progress(sys.stderr),
+        )
+    except StoreiiError as exc:
+        sys.stderr.write("\r\x1b[K")
+        raise SystemExit(f"encode failed: {exc}")
+
+    sys.stderr.write("\r\x1b[K")
     print(
         f"Encoded {result.input_name} into {result.output_path} "
         f"({result.frame_count} frames, {result.video_bytes} bytes)."

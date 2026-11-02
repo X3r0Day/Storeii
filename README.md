@@ -68,3 +68,10 @@ python3 Storeii/dec.py ./example.avi ./decoded
 
 - The bot can only send files that fit within Discord's upload limit (10MB) for the current server or DM.
 - Encoding uses a lossless PNG-based AVI stream so the bit pattern survives the round-trip.
+- Every frame carries a small tag (magic + sequence number), so a transcoder that duplicates or drops frames doesn't shift the payload out of alignment the way a plain byte stream would.
+- The decoder recovers the logical pixel grid instead of trusting the file's resolution, so rescaled renditions (1080p/720p/480p/…) still decode.
+- Quick self-check, no ffmpeg needed:
+
+  ```bash
+  python3 Storeii/selftest.py
+  ```
