@@ -19,21 +19,15 @@ DEFAULT_FRAME_RATE = 25
 DEFAULT_PIXEL_SIZE = 8
 DEFAULT_VIDEO_EXTENSION = ".avi"
 
-# v2 file header, kept around so old videos still decode
 _HEADER_MAGIC = b"STI2"
 _HEADER_STRUCT = struct.Struct(">4sIQ")
 _ECC_SYMBOLS = 30
 
-# v3 layout. Each frame tags itself (so frames can be reordered or de-duplicated after a
-# transcoder messes with timing), and the file header stores the logical grid rather than
-# trusting whatever resolution the video comes back at.
 _FILE_MAGIC = b"STI3"
-_FILE_HEADER = struct.Struct(">4sHHIIH")  # magic, grid_w, grid_h, frames, payload_len, name_len
+_FILE_HEADER = struct.Struct(">4sHHIIH")
 _FRAME_MAGIC = 0x5746
-_FRAME_HEADER = struct.Struct(">HH")      # magic, seq
+_FRAME_HEADER = struct.Struct(">HH")
 
-# Block sizes to try against an incoming resolution. The default grid is probed first, so
-# the common 1080p/720p/480p case costs a single decode attempt.
 _BLOCK_SIZES = (
     4, 5, 6, 8, 10, 12, 16, 20, 24, 25, 30, 32, 40,
     48, 50, 60, 64, 80, 96, 100, 120, 128, 160, 192, 200, 240,
@@ -105,6 +99,16 @@ def _frame_from_bytes(frame_bytes: bytes, width: int, height: int, pix: int) -> 
     return cv2.resize(frame, (width, height), interpolation=cv2.INTER_NEAREST)
 
 
+def _monob_frame(frame_bytes: bytes, width: int, height: int, pix: int) -> bytes:
+    grid_w, grid_h, _, _ = _validate_geometry(width, height, pix)
+    bits = np.unpackbits(np.frombuffer(frame_bytes, dtype=np.uint8)).reshape(grid_h, grid_w)
+    if pix % 8 == 0:
+        rows = np.repeat(bits[:, :, None] * 255, pix // 8, axis=2).reshape(grid_h, width // 8)
+    else:
+        rows = np.packbits(np.repeat(bits, pix, axis=1), axis=1)
+    return np.repeat(rows.astype(np.uint8), pix, axis=0).tobytes()
+
+
 def _threshold_frame(frame: np.ndarray, reduced_width: int, reduced_height: int) -> bytes:
     if frame.ndim == 3:
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -114,18 +118,11 @@ def _threshold_frame(frame: np.ndarray, reduced_width: int, reduced_height: int)
 
 
 def _frame_to_bits(frame: np.ndarray, grid_w: int, grid_h: int) -> bytes:
-    # INTER_AREA averages each source block into one grid cell; INTER_NEAREST samples a
-    # single pixel and lands off-grid as soon as the video has been rescaled.
     if frame.ndim == 3:
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     small = cv2.resize(frame, (grid_w, grid_h), interpolation=cv2.INTER_AREA)
     return np.packbits((small > 127).astype(np.uint8).reshape(-1)).tobytes()
 
-
-# Reed-Solomon (255,225) over GF(2^8). Same field and generator as reedsolo, so the bytes
-# written to disk are unchanged and old videos still decode. reedsolo is pure Python and was
-# the slowest step in both directions, so encoding and the error-free decode path are
-# vectorized here; reedsolo only runs when there are actual errors to repair.
 _RS_N = 255
 _RS_NSYM = _ECC_SYMBOLS
 _RS_K = _RS_N - _RS_NSYM
@@ -146,7 +143,6 @@ def _rs_tables():
         exp[i] = exp[i - _RS_N]
     return np.array(exp, np.uint8), np.array(log, np.uint8)
 
-
 _RS_EXP, _RS_LOG = _rs_tables()
 
 
@@ -160,7 +156,6 @@ def _rs_gen_logs():
             nxt[j + 1] ^= 0 if c == 0 else int(_RS_EXP[int(_RS_LOG[c]) + int(_RS_LOG[root])])
         g = nxt
     return np.array([int(_RS_LOG[c]) for c in g[1:]], np.uint16)
-
 
 _RS_G = _rs_gen_logs()
 
@@ -218,12 +213,14 @@ def _rs_decode(encoded: bytes) -> bytes:
 
 
 class _PipeWriter:
+    mono = True
+
     def __init__(self, cmd: list[str], path: Path):
         self.path = path
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
-    def write(self, frame: np.ndarray) -> None:
-        self.proc.stdin.write(frame.data)
+    def write(self, data: bytes) -> None:
+        self.proc.stdin.write(data)
 
     def close(self) -> None:
         self.proc.stdin.close()
@@ -232,6 +229,8 @@ class _PipeWriter:
 
 
 class _CvWriter:
+    mono = False
+
     def __init__(self, path: Path, width: int, height: int, fps: int):
         self.writer = cv2.VideoWriter(
             str(path), cv2.VideoWriter_fourcc(*"png "), fps, (width, height), isColor=False
@@ -247,13 +246,11 @@ class _CvWriter:
 
 
 def _png_writer(path: Path, width: int, height: int, fps: int) -> _PipeWriter | _CvWriter:
-    # ffmpeg streams frames through a pipe and is several times faster than OpenCV's writer
-    # for the same PNG output; fall back to OpenCV when it isn't installed.
     if shutil.which("ffmpeg"):
         cmd = [
             "ffmpeg", "-y", "-v", "error",
-            "-f", "rawvideo", "-pix_fmt", "gray", "-s", f"{width}x{height}", "-r", str(fps),
-            "-i", "-", "-c:v", "png", "-compression_level", "6", str(path),
+            "-f", "rawvideo", "-pix_fmt", "monob", "-s", f"{width}x{height}", "-r", str(fps),
+            "-i", "-", "-c:v", "png", "-pix_fmt", "monob", "-compression_level", "6", str(path),
         ]
         return _PipeWriter(cmd, path)
     return _CvWriter(path, width, height, fps)
@@ -310,7 +307,11 @@ def encode_file_to_video(
             chunk = stream[seq * data_per_frame : (seq + 1) * data_per_frame]
             if len(chunk) < data_per_frame:
                 chunk += b"\x00" * (data_per_frame - len(chunk))
-            writer.write(_frame_from_bytes(_FRAME_HEADER.pack(_FRAME_MAGIC, seq) + chunk, width, height, pix))
+            payload = _FRAME_HEADER.pack(_FRAME_MAGIC, seq) + chunk
+            if writer.mono:
+                writer.write(_monob_frame(payload, width, height, pix))
+            else:
+                writer.write(_frame_from_bytes(payload, width, height, pix))
             written += 1
             if progress is not None:
                 progress(written, frame_count)
@@ -341,7 +342,6 @@ def _candidate_grids(frame_w: int, frame_h: int) -> list[tuple[int, int]]:
         if frame_w % block == 0 and frame_h % block == 0:
             take(frame_w // block, frame_h // block)
 
-    # aspect-preserving sweep; only reached for encodes that don't match a block size above
     for gw in range(8, _GRID_SWEEP_LIMIT + 1):
         take(gw, round(gw * frame_h / frame_w))
 
@@ -400,8 +400,6 @@ def _decode_v3(video_path: Path, progress: Progress | None = None) -> tuple[str,
         grid_w, grid_h = grid
         per_frame = (grid_w * grid_h) // 8 - _FRAME_HEADER.size
 
-        # seq 0 carries the file header, so we can read the frame count up front and ignore
-        # any seq beyond it (a stray tag byte can otherwise look like a huge index)
         frame_count = _FILE_HEADER.unpack_from(_frame_to_bits(first, grid_w, grid_h), _FRAME_HEADER.size)[3]
 
         chunks: dict[int, bytes] = {}
@@ -425,6 +423,101 @@ def _decode_v3(video_path: Path, progress: Progress | None = None) -> tuple[str,
             consume(frame)
     finally:
         capture.release()
+
+    if not chunks:
+        raise InvalidVideoError("no tagged frames survived")
+
+    stream = bytearray()
+    for seq in range(max(chunks) + 1):
+        stream += chunks.get(seq, b"\x00" * per_frame)
+
+    return _parse_v3(bytes(stream))
+
+
+def _stream_size(video_path: Path) -> tuple[int, int]:
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+         "stream=width,height", "-of", "csv=p=0", str(video_path)],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    if not out:
+        raise InvalidVideoError("could not read the video size")
+    width, height = out.splitlines()[0].split(",")[:2]
+    return int(width), int(height)
+
+
+def _monob_bits(packed: bytes, width: int, height: int, grid_w: int, grid_h: int) -> bytes | None:
+    row_bytes = (width + 7) // 8
+    if height % grid_h or row_bytes % grid_w:
+        return None
+    block_h, block_w = height // grid_h, row_bytes // grid_w
+    if block_h < 1 or block_w < 1:
+        return None
+    arr = np.frombuffer(packed, np.uint8).reshape(height, row_bytes)
+    return np.packbits(arr[::block_h, ::block_w] > 0).tobytes()
+
+
+def _probe_grid_monob(packed: bytes, width: int, height: int) -> tuple[int, int] | None:
+    for gw, gh in _candidate_grids(width, height):
+        bits = _monob_bits(packed, width, height, gw, gh)
+        if bits is None or len(bits) < _FRAME_HEADER.size + _FILE_HEADER.size:
+            continue
+        magic, seq = _FRAME_HEADER.unpack_from(bits)
+        if magic != _FRAME_MAGIC or seq != 0:
+            continue
+        fmagic, fgw, fgh, *_ = _FILE_HEADER.unpack_from(bits, _FRAME_HEADER.size)
+        if fmagic == _FILE_MAGIC and (fgw, fgh) == (gw, gh):
+            return gw, gh
+    return None
+
+
+def _decode_v3_monob(video_path: Path, progress: Progress | None = None) -> tuple[str, bytes]:
+    if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
+        raise InvalidVideoError("ffmpeg not available")
+
+    width, height = _stream_size(video_path)
+    row_bytes = (width + 7) // 8
+    frame_bytes = height * row_bytes
+
+    proc = subprocess.Popen(
+        ["ffmpeg", "-v", "error", "-i", str(video_path), "-f", "rawvideo", "-pix_fmt", "monob", "-"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    try:
+        first = proc.stdout.read(frame_bytes)
+        grid = _probe_grid_monob(first, width, height) if len(first) == frame_bytes else None
+        if grid is None:
+            raise InvalidVideoError("not a native Storeii video")
+
+        grid_w, grid_h = grid
+        per_frame = (grid_w * grid_h) // 8 - _FRAME_HEADER.size
+        first_bits = _monob_bits(first, width, height, grid_w, grid_h)
+        frame_count = _FILE_HEADER.unpack_from(first_bits, _FRAME_HEADER.size)[3]
+
+        chunks: dict[int, bytes] = {}
+
+        def take(packed: bytes) -> None:
+            bits = _monob_bits(packed, width, height, grid_w, grid_h)
+            if bits is None or len(bits) < _FRAME_HEADER.size:
+                return
+            magic, seq = _FRAME_HEADER.unpack_from(bits)
+            if magic != _FRAME_MAGIC or seq >= frame_count:
+                return
+            chunks.setdefault(seq, bits[_FRAME_HEADER.size : _FRAME_HEADER.size + per_frame])
+            if progress is not None:
+                progress(len(chunks), frame_count)
+
+        take(first)
+        while True:
+            packed = proc.stdout.read(frame_bytes)
+            if len(packed) < frame_bytes:
+                break
+            take(packed)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.stdout.close()
+        proc.wait()
 
     if not chunks:
         raise InvalidVideoError("no tagged frames survived")
@@ -564,12 +657,17 @@ def decode_video_to_file(
     fallback_name = output_filename or f"{video_path.stem}.bin"
 
     try:
-        filename, file_bytes = _decode_v3(video_path, progress)
+        filename, file_bytes = _decode_v3_monob(video_path, progress)
     except InvalidVideoError:
         try:
-            filename, file_bytes = _parse_payload(_extract_payload(video_path, pix, progress), fallback_name)
+            filename, file_bytes = _decode_v3(video_path, progress)
         except InvalidVideoError:
-            return _decode_legacy_video(video_path, output_dir, fallback_name, pix, progress)
+            try:
+                filename, file_bytes = _parse_payload(
+                    _extract_payload(video_path, pix, progress), fallback_name
+                )
+            except InvalidVideoError:
+                return _decode_legacy_video(video_path, output_dir, fallback_name, pix, progress)
 
     output_path = output_dir / _safe_filename(output_filename or filename, fallback_name)
     output_path.write_bytes(file_bytes)

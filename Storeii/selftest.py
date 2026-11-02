@@ -74,7 +74,6 @@ def main() -> int:
         _reencode(native, work / "third.avi", 1 / 3)
         _repeat(native, work / "dup.avi", 4)
 
-        # custom grid, then shrink it, to push the decoder through the candidate sweep
         small = work / "small.avi"
         encode_file_to_video(src, small, width=1280, height=720)
         _reencode(small, work / "small_half.avi", 0.5)
