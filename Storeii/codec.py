@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import math
+import shutil
 import struct
+import subprocess
 import zlib
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -120,15 +122,150 @@ def _frame_to_bits(frame: np.ndarray, grid_w: int, grid_h: int) -> bytes:
     return np.packbits((small > 127).astype(np.uint8).reshape(-1)).tobytes()
 
 
+# Reed-Solomon (255,225) over GF(2^8). Same field and generator as reedsolo, so the bytes
+# written to disk are unchanged and old videos still decode. reedsolo is pure Python and was
+# the slowest step in both directions, so encoding and the error-free decode path are
+# vectorized here; reedsolo only runs when there are actual errors to repair.
+_RS_N = 255
+_RS_NSYM = _ECC_SYMBOLS
+_RS_K = _RS_N - _RS_NSYM
+_RS_PRIM = 0x11D
+
+
+def _rs_tables():
+    exp = [0] * (_RS_N * 2)
+    log = [0] * (_RS_N + 1)
+    x = 1
+    for i in range(_RS_N):
+        exp[i] = x
+        log[x] = i
+        x <<= 1
+        if x & 0x100:
+            x ^= _RS_PRIM
+    for i in range(_RS_N, _RS_N * 2):
+        exp[i] = exp[i - _RS_N]
+    return np.array(exp, np.uint8), np.array(log, np.uint8)
+
+
+_RS_EXP, _RS_LOG = _rs_tables()
+
+
+def _rs_gen_logs():
+    g = [1]
+    for i in range(_RS_NSYM):
+        root = int(_RS_EXP[i])
+        nxt = [0] * (len(g) + 1)
+        for j, c in enumerate(g):
+            nxt[j] ^= c
+            nxt[j + 1] ^= 0 if c == 0 else int(_RS_EXP[int(_RS_LOG[c]) + int(_RS_LOG[root])])
+        g = nxt
+    return np.array([int(_RS_LOG[c]) for c in g[1:]], np.uint16)
+
+
+_RS_G = _rs_gen_logs()
+
+
+def _rs_remainder(blocks: np.ndarray, steps: int) -> np.ndarray:
+    rows = blocks.shape[0]
+    buf = np.concatenate([blocks, np.zeros((rows, _RS_NSYM), np.uint8)], axis=1)
+    for i in range(steps):
+        coef = buf[:, i]
+        if not coef.any():
+            continue
+        terms = _RS_EXP[_RS_LOG[coef].astype(np.uint16)[:, None] + _RS_G[None, :]]
+        terms[coef == 0] = 0
+        buf[:, i + 1 : i + 1 + _RS_NSYM] ^= terms
+    return buf[:, steps : steps + _RS_NSYM]
+
+
+def _rs_encode(compressed: bytes) -> bytes:
+    if not compressed:
+        return b""
+    whole = len(compressed) // _RS_K
+    out = bytearray()
+    if whole:
+        blocks = np.frombuffer(compressed[: whole * _RS_K], np.uint8).reshape(whole, _RS_K)
+        ecc = _rs_remainder(blocks, _RS_K)
+        out += np.concatenate([blocks, ecc], axis=1).tobytes()
+    tail = compressed[whole * _RS_K :]
+    if tail:
+        row = np.frombuffer(tail, np.uint8)[None, :]
+        out += tail + _rs_remainder(row, len(tail)).tobytes()
+    return bytes(out)
+
+
+def _rs_decode(encoded: bytes) -> bytes:
+    if not encoded:
+        return b""
+    whole = len(encoded) // _RS_N
+    tail = encoded[whole * _RS_N :]
+
+    clean = True
+    if whole:
+        codewords = np.frombuffer(encoded[: whole * _RS_N], np.uint8).reshape(whole, _RS_N)
+        clean = not _rs_remainder(codewords, _RS_K).any()
+    if clean and tail:
+        if len(tail) <= _RS_NSYM:
+            clean = False
+        else:
+            clean = not _rs_remainder(np.frombuffer(tail, np.uint8)[None, :], len(tail) - _RS_NSYM).any()
+
+    if clean:
+        msg = np.frombuffer(encoded[: whole * _RS_N], np.uint8).reshape(whole, _RS_N)[:, :_RS_K].tobytes()
+        return msg + tail[: len(tail) - _RS_NSYM]
+
+    return bytes(RSCodec(_RS_NSYM).decode(encoded)[0])
+
+
+class _PipeWriter:
+    def __init__(self, cmd: list[str], path: Path):
+        self.path = path
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    def write(self, frame: np.ndarray) -> None:
+        self.proc.stdin.write(frame.data)
+
+    def close(self) -> None:
+        self.proc.stdin.close()
+        if self.proc.wait() != 0:
+            raise StoreiiError("ffmpeg failed to write the video file.")
+
+
+class _CvWriter:
+    def __init__(self, path: Path, width: int, height: int, fps: int):
+        self.writer = cv2.VideoWriter(
+            str(path), cv2.VideoWriter_fourcc(*"png "), fps, (width, height), isColor=False
+        )
+        if not self.writer.isOpened():
+            raise StoreiiError("OpenCV could not open the output video writer.")
+
+    def write(self, frame: np.ndarray) -> None:
+        self.writer.write(frame)
+
+    def close(self) -> None:
+        self.writer.release()
+
+
+def _png_writer(path: Path, width: int, height: int, fps: int) -> _PipeWriter | _CvWriter:
+    # ffmpeg streams frames through a pipe and is several times faster than OpenCV's writer
+    # for the same PNG output; fall back to OpenCV when it isn't installed.
+    if shutil.which("ffmpeg"):
+        cmd = [
+            "ffmpeg", "-y", "-v", "error",
+            "-f", "rawvideo", "-pix_fmt", "gray", "-s", f"{width}x{height}", "-r", str(fps),
+            "-i", "-", "-c:v", "png", "-compression_level", "6", str(path),
+        ]
+        return _PipeWriter(cmd, path)
+    return _CvWriter(path, width, height, fps)
+
+
 def _compress_payload(raw: bytes) -> bytes:
-    compressed = zlib.compress(raw, level=9)
-    return bytes(RSCodec(_ECC_SYMBOLS).encode(compressed))
+    return _rs_encode(zlib.compress(raw, level=9))
 
 
 def _decompress_payload(encoded: bytes) -> bytes:
     try:
-        compressed = bytes(RSCodec(_ECC_SYMBOLS).decode(encoded)[0])
-        return zlib.decompress(compressed)
+        return zlib.decompress(_rs_decode(encoded))
     except (ReedSolomonError, zlib.error) as exc:
         raise InvalidVideoError("Failed to decode or decompress payload data.") from exc
 
@@ -165,17 +302,7 @@ def encode_file_to_video(
         _FILE_MAGIC, grid_w, grid_h, frame_count, len(encoded_payload), len(filename_bytes)
     ) + filename_bytes + encoded_payload
 
-    writer = cv2.VideoWriter(
-        str(output_video_path),
-        cv2.VideoWriter_fourcc(*"png "),
-        frame_rate,
-        (width, height),
-        isColor=False,
-    )
-    if not writer.isOpened():
-        raise StoreiiError(
-            "OpenCV could not open the output video writer."
-        )
+    writer = _png_writer(output_video_path, width, height, frame_rate)
 
     written = 0
     try:
@@ -188,7 +315,7 @@ def encode_file_to_video(
             if progress is not None:
                 progress(written, frame_count)
     finally:
-        writer.release()
+        writer.close()
 
     return EncodeResult(
         output_path=output_video_path,
